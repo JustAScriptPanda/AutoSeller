@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from discord.ui import Modal, TextInput
 import discord
-
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -12,7 +11,6 @@ if TYPE_CHECKING:
 class SetPricePopup(Modal, title="New Price Set"):
     def __init__(self, view: ControlPanel):
         super().__init__(timeout=None)
-
         self.view = view
 
     new_price = TextInput(
