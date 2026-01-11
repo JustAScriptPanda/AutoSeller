@@ -134,93 +134,76 @@ class Item:
         skip_on_sale: bool = False,
         skip_if_cheapest: bool = False,
         verbose: bool = True,
-        retries: int = 3
+        retries: int = 1
     ) -> Optional[int]:
         await self.fetch_collectibles()
 
         sold_amount = 0
         price_to_sell = (price or self.price_to_sell)
 
-        if not self.collectibles:
-            if verbose:
-                Display.warning(f"No collectibles found for {self.name}")
-            return 0
-
         for col in self.collectibles:
             tries = 0
-            success = False
 
             if col.skip_on_sale:
-                if verbose:
-                    Display.skipping(f"Skipping collectible #{col.serial} (marked to skip)")
                 continue
 
-            # Check if already on sale at the same price
+            # Check if item is already on sale at the same price
             if col.on_sale and col.sale_price == price_to_sell:
-                if skip_on_sale:
-                    if verbose:
-                        Display.skipping(f"This collectible is already on sale for the same price [g(#{col.serial})]")
-                    continue
-                else:
-                    # Take it off sale first
-                    if verbose:
-                        Display.info(f"Taking collectible #{col.serial} off sale to relist...")
-                    await col.take_off_sale(self.auth)
-                    await asyncio.sleep(0.5)
+                if verbose:
+                    Display.skipping(f"This collectible is already on sale for the same price [g(#{col.serial})]")
+                continue
 
-            # Check if already on sale and skip_on_sale is true
+            # Check if we should skip items already on sale
             elif col.on_sale and skip_on_sale:
                 if verbose:
                     Display.skipping(f"This collectible is already on sale [g(#{col.serial})]")
                 continue
 
-            # Check if already the cheapest and skip_if_cheapest is true
-            elif col.on_sale and skip_if_cheapest and self.lowest_resale_price == col.sale_price:
+            # Check if we should skip if we're already the cheapest
+            elif skip_if_cheapest and col.on_sale and self.lowest_resale_price == col.sale_price:
                 if verbose:
                     Display.skipping(f"You are already selling this collectible for the cheapest price [g(#{col.serial})]")
                 continue
 
-            # If item is on sale at different price, take it off first
-            elif col.on_sale and col.sale_price != price_to_sell:
+            # If item is on sale but at a different price, take it off sale first
+            if col.on_sale and col.sale_price != price_to_sell:
                 if verbose:
                     Display.info(f"Taking collectible #{col.serial} off sale to relist at new price...")
                 await col.take_off_sale(self.auth)
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.5)  # Small delay before relisting
 
-            # Try to sell the item
-            while tries < retries and not success:
+            # Now sell the item
+            while True:
                 response = await col.sell(price_to_sell, self.auth)
 
                 if response is None:
-                    if verbose:
-                        Display.error(f"Failed to sell collectible #{col.serial} (no response)")
-                    tries += 1
-                    await asyncio.sleep(2)
-                    continue
-
-                if response.status == 200:
-                    if verbose:
-                        Display.success(f"Successfully sold for $[g{price_to_sell} (#{col.serial})]")
-                    sold_amount += 1
-                    success = True
-                elif response.status == 429:
-                    if verbose:
-                        Display.error("Rate limited! Waiting 30 seconds...")
-                    await asyncio.sleep(30)
-                    tries += 1
-                elif response.status == 403:
-                    if verbose:
-                        Display.error(f"Forbidden to sell collectible #{col.serial}")
                     break
-                else:
-                    if verbose:
-                        error_text = await response.text() if response else "Unknown error"
-                        Display.error(f"Failed to sell collectible #{col.serial} ({response.status}): {error_text[:100]}")
-                    tries += 1
-                    await asyncio.sleep(2)
 
-            if not success and verbose:
-                Display.error(f"Failed to sell collectible #{col.serial} after {retries} attempts")
+                match response.status:
+                    case 200:
+                        if verbose:
+                            Display.success(f"Successfully sold for $[g{price_to_sell} (#{col.serial})]")
+
+                        sold_amount += 1
+                        break
+                    case 429:
+                        if verbose:
+                            Display.error("You got rate limited! Trying again in 30 seconds...")
+                        tries += 1
+                        await asyncio.sleep(30)
+                    case 403:
+                        if response.reason == "Forbidden":
+                            break
+                        tries += 1
+                    case _:
+                        if verbose:
+                            Display.error(f"Failed to sell limited ({response.status}): {response.reason}")
+
+                        tries += 1
+                        await asyncio.sleep(3)
+
+                if tries > retries:
+                    break
 
         return sold_amount
 
