@@ -72,14 +72,24 @@ class Collectible:
             "sellerType": "User"
         }
 
-        async with auth.patch(
-            f"apis.roblox.com/marketplace-sales/v1/item/{self.item_id}/instance/{self.instance_id}/resale",
-            json=payload
-        ) as response:
-            if response.status == 200:
-                self.on_sale = True
+        try:
+            async with auth.patch(
+                f"apis.roblox.com/marketplace-sales/v1/item/{self.item_id}/instance/{self.instance_id}/resale",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as response:
+                if response.status == 200:
+                    self.on_sale = True
 
-            return response
+                return response
+        except aiohttp.ClientError as e:
+            # Return a mock response with error status
+            class MockResponse:
+                def __init__(self, status, reason):
+                    self.status = status
+                    self.reason = reason
+                    
+            return MockResponse(0, str(e))
 
     async def take_off_sale(self, auth: Auth) -> Optional[int]:
         if None in (self.item_id, self.instance_id, self.product_id):
@@ -92,11 +102,15 @@ class Collectible:
             "sellerType": "User"
         }
 
-        async with auth.patch(
-            f"apis.roblox.com/marketplace-sales/v1/item/{self.item_id}/instance/{self.instance_id}/resale",
-            json=payload
-        ) as response:
-            if response.status == 200:
-                self.on_sale = False
+        try:
+            async with auth.patch(
+                f"apis.roblox.com/marketplace-sales/v1/item/{self.item_id}/instance/{self.instance_id}/resale",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as response:
+                if response.status == 200:
+                    self.on_sale = False
 
-            return response.status
+                return response.status
+        except aiohttp.ClientError:
+            return None
