@@ -8,6 +8,7 @@ if TYPE_CHECKING:
     from .item import Item
 
 from ..clients import Auth
+from ..visuals import Display
 
 __all__ = ("Collectible",)
 
@@ -50,15 +51,16 @@ class Collectible:
             item_id: Optional[int] = None,
             instance_id: Optional[str] = None,
             product_id: Optional[str] = None,
-            skip_on_sale: Optional[str] = None
+            skip_on_sale: Optional[bool] = None
     ) -> None:
         self.on_sale = on_sale
         self.sale_price = sale_price
         self.item_id = item_id
-        self.product_id = product_id
         self.instance_id = instance_id
+        self.product_id = product_id
 
-        self.skip_on_sale = skip_on_sale
+        if skip_on_sale is not None:
+            self.skip_on_sale = skip_on_sale
 
     async def sell(self, price: int, auth: Auth) -> Optional[aiohttp.ClientResponse]:
         if None in (self.item_id, self.instance_id, self.product_id) or self.skip_on_sale:
@@ -72,14 +74,19 @@ class Collectible:
             "sellerType": "User"
         }
 
-        async with auth.patch(
-            f"apis.roblox.com/marketplace-sales/v1/item/{self.item_id}/instance/{self.instance_id}/resale",
-            json=payload
-        ) as response:
-            if response.status == 200:
-                self.on_sale = True
+        try:
+            async with auth.patch(
+                f"apis.roblox.com/marketplace-sales/v1/item/{self.item_id}/instance/{self.instance_id}/resale",
+                json=payload
+            ) as response:
+                if response.status == 200:
+                    self.on_sale = True
+                    self.sale_price = price
 
-            return response
+                return response
+        except Exception as e:
+            Display.error(f"Error selling collectible #{self.serial}: {e}")
+            return None
 
     async def take_off_sale(self, auth: Auth) -> Optional[int]:
         if None in (self.item_id, self.instance_id, self.product_id):
@@ -92,11 +99,16 @@ class Collectible:
             "sellerType": "User"
         }
 
-        async with auth.patch(
-            f"apis.roblox.com/marketplace-sales/v1/item/{self.item_id}/instance/{self.instance_id}/resale",
-            json=payload
-        ) as response:
-            if response.status == 200:
-                self.on_sale = False
+        try:
+            async with auth.patch(
+                f"apis.roblox.com/marketplace-sales/v1/item/{self.item_id}/instance/{self.instance_id}/resale",
+                json=payload
+            ) as response:
+                if response.status == 200:
+                    self.on_sale = False
+                    self.sale_price = None
 
-            return response.status
+                return response.status
+        except Exception as e:
+            Display.error(f"Error taking collectible #{self.serial} off sale: {e}")
+            return None
