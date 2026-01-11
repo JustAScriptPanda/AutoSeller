@@ -147,24 +147,37 @@ class Item:
             if col.skip_on_sale:
                 continue
 
-            elif col.sale_price == price_to_sell:
+            # Check if item is already on sale at the same price
+            if col.on_sale and col.sale_price == price_to_sell:
                 if verbose:
                     Display.skipping(f"This collectible is already on sale for the same price [g(#{col.serial})]")
                 continue
 
-            elif col.on_sale:
-                if skip_on_sale:
-                    if verbose:
-                        Display.skipping(f"This collectible is already on sale [g(#{col.serial})]")
-                    continue
+            # Check if we should skip items already on sale
+            elif col.on_sale and skip_on_sale:
+                if verbose:
+                    Display.skipping(f"This collectible is already on sale [g(#{col.serial})]")
+                continue
 
-                elif skip_if_cheapest and self.lowest_resale_price == col.sale_price:
-                    if verbose:
-                        Display.skipping(f"You are already selling this collectible for the cheapest price [g(#{col.serial})]")
-                    continue
+            # Check if we should skip if we're already the cheapest
+            elif skip_if_cheapest and col.on_sale and self.lowest_resale_price == col.sale_price:
+                if verbose:
+                    Display.skipping(f"You are already selling this collectible for the cheapest price [g(#{col.serial})]")
+                continue
 
+            # If item is on sale but at a different price, take it off sale first
+            if col.on_sale and col.sale_price != price_to_sell:
+                if verbose:
+                    Display.info(f"Taking collectible #{col.serial} off sale to relist at new price...")
+                await col.take_off_sale(self.auth)
+                await asyncio.sleep(0.5)  # Small delay before relisting
+
+            # Now sell the item
             while True:
                 response = await col.sell(price_to_sell, self.auth)
+
+                if response is None:
+                    break
 
                 match response.status:
                     case 200:
@@ -182,8 +195,6 @@ class Item:
                         if response.reason == "Forbidden":
                             break
                         tries += 1
-                    case None:
-                        break
                     case _:
                         if verbose:
                             Display.error(f"Failed to sell limited ({response.status}): {response.reason}")
