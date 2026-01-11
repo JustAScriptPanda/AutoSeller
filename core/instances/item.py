@@ -1,7 +1,7 @@
 import asyncio
 from datetime import datetime
-
 from typing import Optional, List, Any, Union
+import aiohttp
 
 from ..clients import Auth
 from ..utils import IgnoreNew
@@ -134,7 +134,8 @@ class Item:
         skip_on_sale: bool = False,
         skip_if_cheapest: bool = False,
         verbose: bool = True,
-        retries: int = 1
+        retries: int = 3,
+        max_retries: int = 5
     ) -> Optional[int]:
         await self.fetch_collectibles()
 
@@ -143,66 +144,88 @@ class Item:
 
         for col in self.collectibles:
             tries = 0
+            connection_retries = 0
 
             if col.skip_on_sale:
                 continue
 
-            # Check if item is already on sale at the same price
-            if col.on_sale and col.sale_price == price_to_sell:
+            elif col.sale_price == price_to_sell:
                 if verbose:
                     Display.skipping(f"This collectible is already on sale for the same price [g(#{col.serial})]")
                 continue
 
-            # Check if we should skip items already on sale
-            elif col.on_sale and skip_on_sale:
-                if verbose:
-                    Display.skipping(f"This collectible is already on sale [g(#{col.serial})]")
-                continue
+            elif col.on_sale:
+                if skip_on_sale:
+                    if verbose:
+                        Display.skipping(f"This collectible is already on sale [g(#{col.serial})]")
+                    continue
 
-            # Check if we should skip if we're already the cheapest
-            elif skip_if_cheapest and col.on_sale and self.lowest_resale_price == col.sale_price:
-                if verbose:
-                    Display.skipping(f"You are already selling this collectible for the cheapest price [g(#{col.serial})]")
-                continue
+                elif skip_if_cheapest and self.lowest_resale_price == col.sale_price:
+                    if verbose:
+                        Display.skipping(f"You are already selling this collectible for the cheapest price [g(#{col.serial})]")
+                    continue
 
-            # If item is on sale but at a different price, take it off sale first
-            if col.on_sale and col.sale_price != price_to_sell:
-                if verbose:
-                    Display.info(f"Taking collectible #{col.serial} off sale to relist at new price...")
-                await col.take_off_sale(self.auth)
-                await asyncio.sleep(0.5)  # Small delay before relisting
-
-            # Now sell the item
             while True:
-                response = await col.sell(price_to_sell, self.auth)
-
-                if response is None:
-                    break
-
-                match response.status:
-                    case 200:
+                try:
+                    response = await col.sell(price_to_sell, self.auth)
+                    
+                    if response is None:
                         if verbose:
-                            Display.success(f"Successfully sold for $[g{price_to_sell} (#{col.serial})]")
-
-                        sold_amount += 1
+                            Display.error(f"Failed to sell collectible #{col.serial}: No response")
                         break
-                    case 429:
-                        if verbose:
-                            Display.error("You got rate limited! Trying again in 30 seconds...")
-                        tries += 1
-                        await asyncio.sleep(30)
-                    case 403:
-                        if response.reason == "Forbidden":
-                            break
-                        tries += 1
-                    case _:
-                        if verbose:
-                            Display.error(f"Failed to sell limited ({response.status}): {response.reason}")
 
-                        tries += 1
-                        await asyncio.sleep(3)
+                    match response.status:
+                        case 200:
+                            if verbose:
+                                Display.success(f"Successfully sold for $[g{price_to_sell} (#{col.serial})]")
+                            sold_amount += 1
+                            break
+                        case 429:
+                            if verbose:
+                                Display.error("Rate limited! Waiting 30 seconds...")
+                            tries += 1
+                            await asyncio.sleep(30)
+                        case 403:
+                            if response.reason == "Forbidden":
+                                if verbose:
+                                    Display.error("Forbidden: You don't have permission to sell this item")
+                                break
+                            tries += 1
+                            await asyncio.sleep(5)
+                        case None:
+                            if verbose:
+                                Display.error("No response from server")
+                            break
+                        case _:
+                            if verbose:
+                                Display.error(f"Failed to sell ({response.status}): {response.reason}")
+                            tries += 1
+                            await asyncio.sleep(3)
+                            
+                except aiohttp.ClientOSError as e:
+                    connection_retries += 1
+                    if verbose:
+                        Display.error(f"Connection error (attempt {connection_retries}/{max_retries}): {str(e)}")
+                    
+                    if connection_retries >= max_retries:
+                        if verbose:
+                            Display.error("Max connection retries reached. Skipping this item.")
+                        break
+                    
+                    # Exponential backoff for connection errors
+                    wait_time = min(2 ** connection_retries, 30)
+                    await asyncio.sleep(wait_time)
+                    continue
+                    
+                except Exception as e:
+                    if verbose:
+                        Display.error(f"Unexpected error selling collectible #{col.serial}: {str(e)}")
+                    tries += 1
+                    await asyncio.sleep(3)
 
                 if tries > retries:
+                    if verbose:
+                        Display.error(f"Max retries ({retries}) reached for collectible #{col.serial}")
                     break
 
         return sold_amount
@@ -212,105 +235,116 @@ class Item:
                           save_sales: Optional[bool] = True,
                           save_rap: Optional[bool] = True,
                           save_latest_sale: Optional[bool] = True) -> None:
-        async with self.auth.get(
-            f"apis.roblox.com/marketplace-sales/v1/item/{self.item_id}/resale-data"
-        ) as response:
-            if response.status != 200:
-                return None
-
-            data = await response.json()
-
-            if save_sales:
-                for price, amount in zip(data["priceDataPoints"], data["volumeDataPoints"]):
-                    data = {
-                        "price": price["value"],
-                        "amount": amount["value"],
-                        "date": datetime.strptime(price["date"], "%Y-%m-%dT%H:%M:%SZ")
-                    }
-                    self.sales.append(data)
-
-            if save_rap:
-                self.recent_average_price = round(data.get("recentAveragePrice", 0))
-
-            if save_latest_sale:
-                if data["priceDataPoints"] and data["priceDataPoints"][0]["value"]:
-                    self.latest_sale = data["priceDataPoints"][0]["value"]
-                    self.has_sales = True
-                else:
-                    self.has_sales = False
-
-    @Auth.has_auth
-    async def fetch_resales(self, *,
-                            save_resales: Optional[bool] = True,
-                            save_lrp: Optional[bool] = True) -> None:
-        async with self.auth.get(
-            f"apis.roblox.com/marketplace-sales/v1/item/{self.item_id}/resellers?"
-            f"limit=99"
-        ) as response:
-            try:
-                data = (await response.json()).get("data")
-            except:
-                return None
-
-            if data is None:
-                return None
-
-            if save_resales:
-                for resale in data:
-                    seller = resale["seller"]
-
-                    data = {
-                        "lowest_resale_price": resale["price"],
-                        "serial": resale["serialNumber"],
-                        "seller_id": seller["sellerId"],
-                        "seller_name": seller["name"]
-                    }
-                    self.resales.append(data)
-
-            if save_lrp:
-                if data:
-                    self.lowest_resale_price = data[0]["price"]
-                    self.has_resales = True
-                else:
-                    self.has_resales = False
-
-    @Auth.has_auth
-    async def fetch_collectibles(self) -> None:
-        cursor = ""
-
-        while True:
+        try:
             async with self.auth.get(
-                f"apis.roblox.com/marketplace-sales/v1/item/{self.item_id}/resellable-instances?"
-                f"cursor={cursor}&ownerType=User&ownerId={self.auth.user_id}&limit=9999999"
+                f"apis.roblox.com/marketplace-sales/v1/item/{self.item_id}/resale-data"
             ) as response:
                 if response.status != 200:
                     return None
 
                 data = await response.json()
 
-                serials_list = []
+                if save_sales:
+                    for price, amount in zip(data["priceDataPoints"], data["volumeDataPoints"]):
+                        data = {
+                            "price": price["value"],
+                            "amount": amount["value"],
+                            "date": datetime.strptime(price["date"], "%Y-%m-%dT%H:%M:%SZ")
+                        }
+                        self.sales.append(data)
 
-                for instance in data.get("itemInstances"):
-                    col_serial = instance["serialNumber"]
+                if save_rap:
+                    self.recent_average_price = round(data.get("recentAveragePrice", 0))
 
-                    self.add_collectible(
-                        serial=col_serial,
-                        on_sale=(True if instance["saleState"] == "OnSale" else False),
-                        sale_price=instance.get("price"),
-                        item_id=instance["collectibleItemId"],
-                        instance_id=instance["collectibleInstanceId"],
-                        product_id=instance["collectibleProductId"]
-                    )
-                    serials_list.append(col_serial)
+                if save_latest_sale:
+                    if data["priceDataPoints"] and data["priceDataPoints"][0]["value"]:
+                        self.latest_sale = data["priceDataPoints"][0]["value"]
+                        self.has_sales = True
+                    else:
+                        self.has_sales = False
+        except Exception as e:
+            Display.error(f"Error fetching sales: {str(e)}")
 
-                for serial in list(self._collectibles):
-                    if serial not in serials_list:
-                        self.remove_collectible(serial)
-
-                cursor = data.get("nextPageCursor")
-
-                if cursor == data.get("previousPageCursor"):
+    @Auth.has_auth
+    async def fetch_resales(self, *,
+                            save_resales: Optional[bool] = True,
+                            save_lrp: Optional[bool] = True) -> None:
+        try:
+            async with self.auth.get(
+                f"apis.roblox.com/marketplace-sales/v1/item/{self.item_id}/resellers?"
+                f"limit=99"
+            ) as response:
+                try:
+                    data = (await response.json()).get("data")
+                except:
                     return None
+
+                if data is None:
+                    return None
+
+                if save_resales:
+                    for resale in data:
+                        seller = resale["seller"]
+
+                        data = {
+                            "lowest_resale_price": resale["price"],
+                            "serial": resale["serialNumber"],
+                            "seller_id": seller["sellerId"],
+                            "seller_name": seller["name"]
+                        }
+                        self.resales.append(data)
+
+                if save_lrp:
+                    if data:
+                        self.lowest_resale_price = data[0]["price"]
+                        self.has_resales = True
+                    else:
+                        self.has_resales = False
+        except Exception as e:
+            Display.error(f"Error fetching resales: {str(e)}")
+
+    @Auth.has_auth
+    async def fetch_collectibles(self) -> None:
+        cursor = ""
+
+        while True:
+            try:
+                async with self.auth.get(
+                    f"apis.roblox.com/marketplace-sales/v1/item/{self.item_id}/resellable-instances?"
+                    f"cursor={cursor}&ownerType=User&ownerId={self.auth.user_id}&limit=9999999"
+                ) as response:
+                    if response.status != 200:
+                        return None
+
+                    data = await response.json()
+
+                    serials_list = []
+
+                    for instance in data.get("itemInstances", []):
+                        col_serial = instance["serialNumber"]
+
+                        self.add_collectible(
+                            serial=col_serial,
+                            on_sale=(True if instance["saleState"] == "OnSale" else False),
+                            sale_price=instance.get("price"),
+                            item_id=instance["collectibleItemId"],
+                            instance_id=instance["collectibleInstanceId"],
+                            product_id=instance["collectibleProductId"]
+                        )
+                        serials_list.append(col_serial)
+
+                    for serial in list(self._collectibles):
+                        if serial not in serials_list:
+                            self.remove_collectible(serial)
+
+                    cursor = data.get("nextPageCursor")
+
+                    if not cursor or cursor == data.get("previousPageCursor"):
+                        return None
+            except Exception as e:
+                Display.error(f"Error fetching collectibles: {str(e)}")
+                await asyncio.sleep(5)
+                return None
 
     def __len__(self) -> int:
         return len(self.collectibles)
