@@ -131,16 +131,32 @@ class AutoSeller(ConfigLoader):
         if (self.current_index + 2) % 30 or not self.current_index:
             return None
 
-        async with self.auth.post(
-            "apis.roblox.com/marketplace-items/v1/items/details",
-            json={"itemIds": [i.item_id for i in self.items[self.current_index:30]]}
-        ) as response:
-            for item_details in await response.json():
-                item_id = item_details["itemTargetId"]
-
-                if item_details["resaleRestriction"] == 1:
-                    self.not_resable.add(item_id)
-                    self.remove_item(item_id)
+        try:
+            async with self.auth.post(
+                "apis.roblox.com/marketplace-items/v1/items/details",
+                json={"itemIds": [i.item_id for i in self.items[self.current_index:30]]}
+            ) as response:
+                data = await response.json()
+                
+                # Check if response is a dictionary with data
+                if isinstance(data, dict) and "data" in data:
+                    items_data = data["data"]
+                elif isinstance(data, list):
+                    items_data = data
+                else:
+                    # Try to get items from different possible response structures
+                    items_data = data.get("items", []) or data.get("data", [])
+                
+                for item_details in items_data:
+                    if isinstance(item_details, dict):
+                        item_id = item_details.get("itemTargetId") or item_details.get("assetId")
+                        
+                        if item_id and item_details.get("resaleRestriction") == 1:
+                            self.not_resable.add(item_id)
+                            self.remove_item(item_id)
+        except Exception as e:
+            print(f"Error in filter_non_resable: {e}")
+            # Don't crash on this error, just continue
 
     def fetch_item_info(self, *, step_index: int = 1) -> Optional[Iterable[Task]]:
         try:
@@ -195,11 +211,15 @@ class AutoSeller(ConfigLoader):
 
     async def start_selling(self):
         for i in range(2):
-            for task in self.fetch_item_info(step_index=i):
-                await task
+            tasks = self.fetch_item_info(step_index=i)
+            if tasks:
+                for task in tasks:
+                    await task
 
-        if self.auto_sell: await self._auto_sell_items()
-        else: await self._manual_selling()
+        if self.auto_sell: 
+            await self._auto_sell_items()
+        else: 
+            await self._manual_selling()
 
         Tools.clear_console()
         await Display.custom(
@@ -333,7 +353,14 @@ class AutoSeller(ConfigLoader):
                 # Try to get the price floor from the new API if available
                 if items_cap and isinstance(items_cap, dict):
                     item_type = ITEM_TYPES[item_details["assetType"]]
-                    if item_type in items_cap and items_cap[item_type]:
+                    
+                    # Check if items_cap has the expected structure
+                    if isinstance(items_cap, dict) and "limitedItemPriceFloors" in items_cap:
+                        price_floors = items_cap.get("limitedItemPriceFloors")
+                        if price_floors and item_type in price_floors:
+                            asset_cap = price_floors[item_type].get("priceFloor", 0)
+                    elif item_type in items_cap and items_cap[item_type]:
+                        # Old structure
                         asset_cap = items_cap[item_type].get("priceFloor", 0)
                 
                 sell_price = define_sale_price(self.under_cut_amount, self.under_cut_type,
