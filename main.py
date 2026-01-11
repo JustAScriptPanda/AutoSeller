@@ -327,7 +327,15 @@ class AutoSeller(ConfigLoader):
             item_obj = self.get_item(item_id)
 
             if item_obj is None:
-                asset_cap = items_cap[ITEM_TYPES[item_details["assetType"]]]["priceFloor"]
+                # Handle the new API response structure
+                asset_cap = 0  # Default value since price floors are not available in new API
+                
+                # Try to get the price floor from the new API if available
+                if items_cap and isinstance(items_cap, dict):
+                    item_type = ITEM_TYPES[item_details["assetType"]]
+                    if item_type in items_cap and items_cap[item_type]:
+                        asset_cap = items_cap[item_type].get("priceFloor", 0)
+                
                 sell_price = define_sale_price(self.under_cut_amount, self.under_cut_type,
                                                asset_cap, item_details["lowestResalePrice"])
 
@@ -529,8 +537,7 @@ if __name__ == "__main__":
 **************#%%%%%%%%%%%%%%%%%%%%%%%#########*#**#**+++++=+===================+++++++++++++++*****
 *********####**##%%%%%%%%%%%%%%%%%%%%%%%%%%%###***++++++==++==++==============+++++++++*************
 ###################%%%@@@%%%%%%%##########*******++++++=++++++++++=========+++**********************
-%%%%%%%%%%%#%%%#%%%%%%%%@@@@@@@@%%##%##*##*****##**++++++++***++++++++++++**************************
-%%%%%%%%%%%%%%%%%%%%%%%%%%@@@@@@@@@@%%%%%@%########***************++++****************************##
+%%%%%%%%%%%#%%#%%%%%%%%@@@@@@@@%%##%##*##*****##**++++++++***++++++++++++**************************##
+%%%%%%%%%%%%%%%%%%%%%%%%%%@@@@@@@@@@%%%%%@%########***************++++****************************###
 %%%%%%%%%%%%%%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%%%%%%%%%%##########********************************###
 """
-
