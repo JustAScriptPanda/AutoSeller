@@ -1,3 +1,4 @@
+# decorators.py (Updated)
 from traceback import format_exc
 import functools
 import discord
@@ -24,11 +25,20 @@ def base_command(func: Callable):
     @functools.wraps(func)
     async def wrapper(ctx: discord.Message, *args, **kwargs):
         try:
-            if hasattr(ctx, "response"):
-                await ctx.response.defer()
-            else:
-                await ctx.defer()
+            # Try to defer the response if the context supports it
+            try:
+                if hasattr(ctx, "response"):
+                    await ctx.response.defer()
+                elif hasattr(ctx, "defer"):
+                    await ctx.defer()
+            except:
+                pass  # If defer fails, continue anyway
+            
             await func(ctx, *args, **kwargs)
+        except AttributeError as ae:
+            # Special handling for AttributeError
+            error_msg = f"AttributeError: {str(ae)}\n\nThis usually means an object doesn't have the expected attribute."
+            await ctx.reply(embed=exception_embed(error_msg))
         except Exception:
             await ctx.reply(embed=exception_embed(format_exc()))
     return wrapper
