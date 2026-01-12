@@ -1,15 +1,18 @@
+# __init__.py (Updated)
 from typing import Optional, Literal
 
 class TasksManager:
+    # Using more standard emojis that work without UGC issues
     success_emoji = "✅"
     error_emoji = "❌"
-    skip_emoji = "⚫️"
-
+    skip_emoji = "⏭️"  # Changed from "⚫️" to a more standard skip emoji
+    
     def __init__(
         self,
         char_limit: Optional[int] = 4096,
         success_emoji: Optional[str] = None,
-        error_emoji: Optional[str] = None
+        error_emoji: Optional[str] = None,
+        skip_emoji: Optional[str] = None
     ) -> None:
         self.char_limit = char_limit
         self._tasks = ""
@@ -17,14 +20,16 @@ class TasksManager:
             self.success_emoji = success_emoji
         if error_emoji:
             self.error_emoji = error_emoji
-
+        if skip_emoji:
+            self.skip_emoji = skip_emoji
+    
     def check_tasks(func):
         def wrapper(self, *args, **kwargs):
             if len(self._tasks) >= self.char_limit:
                 self._tasks = ""
             return func(self, *args, **kwargs)
         return wrapper
-
+    
     @check_tasks
     def add_new(self, text: str, emoji_type: Literal["success", "error", "skip"]) -> None:
         if emoji_type == "success":
@@ -33,39 +38,49 @@ class TasksManager:
             self._tasks += f"{self.error_emoji} {text}\n"
         elif emoji_type == "skip":
             self._tasks += f"{self.skip_emoji} {text}\n"
-
+    
     @check_tasks
     def add_success(self, text: str) -> None:
         self._tasks += f"{self.success_emoji} {text}\n"
-
+    
     @check_tasks
     def add_error(self, text: str) -> None:
         self._tasks += f"{self.error_emoji} {text}\n"
-
+    
     @check_tasks
     def add_skip(self, text: str) -> None:
         self._tasks += f"{self.skip_emoji} {text}\n"
-
+    
+    def add_custom(self, text: str, emoji: str = "") -> None:
+        """Add a task with a custom emoji"""
+        if len(self._tasks) >= self.char_limit:
+            self._tasks = ""
+        self._tasks += f"{emoji} {text}\n"
+    
     @property
     def tasks(self) -> str:
         return self._tasks
-
+    
+    def clear(self) -> None:
+        """Clear all tasks"""
+        self._tasks = ""
+    
     @classmethod
     def set_success(cls, new: str) -> None:
         cls.success_emoji = new
-
+    
     @classmethod
     def set_error(cls, new: str) -> None:
         cls.error_emoji = new
-
+    
     @classmethod
     def set_skip(cls, new: str) -> None:
         cls.skip_emoji = new
-
+    
     def __len__(self) -> int:
         return len(self._tasks)
-
+    
     def __str__(self) -> str:
         return self._tasks.strip()
-
+    
     __repr__ = __str__
