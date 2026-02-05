@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import os
 import aiohttp
+import json
 
 __import__("warnings").filterwarnings("ignore")
 
@@ -55,7 +56,7 @@ __all__ = ("AutoSeller",)
 class AutoSeller(ConfigLoader):
     __slots__ = ("config", "_items", "auth", "buy_checker", "blacklist",
                  "seen", "not_resable", "current_index", "done",
-                 "total_sold", "selling", "loaded_time", "control_panel")
+                 "total_sold", "selling", "loaded_time", "control_panel", "rich_presence")
 
     def __init__(self,
                  config: dict,
@@ -74,6 +75,7 @@ class AutoSeller(ConfigLoader):
         self.seen = seen
         self.not_resable = not_resable
 
+        self.rich_presence = None
         if self.presence_enabled:
             self.rich_presence = AioPresence(PRESENCE_BOT_ID)
 
@@ -103,9 +105,9 @@ class AutoSeller(ConfigLoader):
         return self._items.pop(_id)
 
     def next_item(self, *, step_index: int = 1) -> None:
-        self.current_index = (self.current_index + 1) % len(self.items)
+        self.current_index = (self.current_index + step_index) % len(self.items)
 
-        if self.presence_enabled:
+        if self.presence_enabled and self.rich_presence:
             asyncio.create_task(self.update_presence())
 
         if not self.current_index:
@@ -114,6 +116,9 @@ class AutoSeller(ConfigLoader):
         self.fetch_item_info(step_index=step_index)
 
     async def update_presence(self) -> None:
+        if not self.rich_presence:
+            return
+            
         easter_egg = random() < 0.3
 
         try:
@@ -126,7 +131,7 @@ class AutoSeller(ConfigLoader):
                 small_text="Roblox",
                 buttons=[{"url": self.current.link, "label": "Selling Item"},
                          {"url": URL_REPOSITORY, "label": "Use Tool Yourself"}],
-                start=int(self.loaded_time.timestamp())
+                start=int(self.loaded_time.timestamp()) if self.loaded_time else None
             )
         except Exception as e:
             Display.error(f"Failed to update rich presence: {str(e)}")
@@ -136,21 +141,59 @@ class AutoSeller(ConfigLoader):
             return None
 
         try:
+            # Get the next 30 items starting from current_index
+            start_idx = self.current_index
+            end_idx = min(start_idx + 30, len(self.items))
+            items_to_check = self.items[start_idx:end_idx]
+            
+            if not items_to_check:
+                return None
+                
+            item_ids = [item.item_id for item in items_to_check]
+            
             async with self.auth.post(
-                "apis.roblox.com/marketplace-items/v1/items/details",
-                json={"itemIds": [i.item_id for i in self.items[self.current_index:30]]}
+                "https://apis.roblox.com/marketplace-items/v1/items/details",
+                json={"itemIds": item_ids}
             ) as response:
-                for item_details in await response.json():
-                    item_id = item_details["itemTargetId"]
-
-                    if item_details["resaleRestriction"] == 1:
-                        self.not_resable.add(item_id)
-                        self.remove_item(item_id)
+                response_data = await response.json()
+                
+                # Handle different response formats
+                if isinstance(response_data, dict):
+                    # If it's a dict with data key
+                    if "data" in response_data:
+                        response_data = response_data["data"]
+                    else:
+                        Display.error(f"Unexpected response format in filter_non_resable: {response_data}")
+                        return
+                
+                for item_details in response_data:
+                    if isinstance(item_details, dict):
+                        item_id = item_details.get("itemTargetId")
+                        resale_restriction = item_details.get("resaleRestriction")
+                        
+                        if resale_restriction == 1 and item_id:
+                            # Convert to int for consistency
+                            try:
+                                item_id_int = int(item_id)
+                            except (ValueError, TypeError):
+                                continue
+                                
+                            self.not_resable.add(item_id_int)
+                            # Remove the item from items list
+                            if item_id_int in self._items:
+                                self.remove_item(item_id_int)
+                    else:
+                        Display.warning(f"Unexpected item format in response: {item_details}")
+                        
         except Exception as e:
             Display.error(f"Error filtering non-resable items: {str(e)}")
 
     def fetch_item_info(self, *, step_index: int = 1) -> Optional[Iterable[Task]]:
         try:
+            # Check if we have enough items
+            if self.current_index + step_index >= len(self.items):
+                return None
+                
             item = self.items[self.current_index + step_index]
         except IndexError:
             return None
@@ -179,21 +222,23 @@ class AutoSeller(ConfigLoader):
         await self._load_items()
         self.sort_items("name")
 
-        if self.presence_enabled:
+        if self.presence_enabled and self.rich_presence:
             try:
                 await self.rich_presence.connect()
                 await self.update_presence()
             except DiscordNotFound:
-                return Display.exception("Could find Discord running to show presence")
+                Display.warning("Could not find Discord running to show presence")
 
         try:
             async with self:
-                tasks = (
-                    discord_bot_start(self) if self.discord_bot else None,
-                    self.buy_checker.start() if self.buy_webhook else None,
-                    self.auth.csrf_token_updater(),
-                    self.start_selling()
-                )
+                tasks = []
+                if self.discord_bot:
+                    tasks.append(discord_bot_start(self))
+                if self.buy_webhook:
+                    tasks.append(self.buy_checker.start())
+                tasks.append(self.auth.csrf_token_updater())
+                tasks.append(self.start_selling())
+                
                 await asyncio.gather(*filter(None, tasks))
         except LoginFailure:
             return Display.exception("Invalid discord token provided")
@@ -348,6 +393,7 @@ class AutoSeller(ConfigLoader):
         user_items = await AssetsLoader(get_user_inventory, ITEM_TYPES.keys()).load(self.auth)
         if not user_items:
             Display.exception("You dont have any limited UGC items")
+            return
 
         item_ids = [str(asset["assetId"]) for asset in user_items]
 
@@ -357,8 +403,55 @@ class AutoSeller(ConfigLoader):
         Display.info(f"Found {len(user_items)} items. Checking them...")
         items_details = await AssetsLoader(get_items_details, item_ids, 120).load(self.auth)
 
-        for item_info in zip(user_items, items_details, items_thumbnails):
-            yield item_info
+        # Process in batches for resale check
+        batch_size = 100
+        for i in range(0, len(user_items), batch_size):
+            batch_end = min(i + batch_size, len(user_items))
+            batch_items = user_items[i:batch_end]
+            batch_details = items_details[i:batch_end]
+            batch_thumbnails = items_thumbnails[i:batch_end]
+            
+            # Check resale for batch
+            batch_item_ids = [str(item["assetId"]) for item in batch_items]
+            try:
+                async with self.auth.post(
+                    "https://apis.roblox.com/marketplace-items/v1/items/details",
+                    json={"itemIds": batch_item_ids}
+                ) as response:
+                    resale_data = await response.json()
+                    if isinstance(resale_data, dict) and "data" in resale_data:
+                        resale_data = resale_data["data"]
+                    elif not isinstance(resale_data, list):
+                        resale_data = []
+            except Exception as e:
+                Display.warning(f"Failed to check resale for batch: {str(e)}")
+                resale_data = []
+            
+            # Create mapping of item_id to resale restriction
+            resale_map = {}
+            for rd in resale_data:
+                if isinstance(rd, dict):
+                    item_id = rd.get("itemTargetId")
+                    restriction = rd.get("resaleRestriction")
+                    if item_id:
+                        resale_map[str(item_id)] = restriction
+            
+            # Process each item in batch
+            for item, item_details, thumbnail in zip(batch_items, batch_details, batch_thumbnails):
+                item_id = str(item["assetId"])
+                
+                # Check resale restriction
+                if resale_map.get(item_id) == 1:
+                    self.not_resable.add(int(item_id))
+                    continue
+                    
+                # Skip if in ignore lists
+                ignored_items = list(self.seen | self.blacklist | self.not_resable)
+                if (int(item_id) in ignored_items or 
+                    item_details.get("creatorTargetId") in self.creators_blacklist):
+                    continue
+                    
+                yield item, item_details, thumbnail
 
     async def _load_items(self) -> None:
         if self.loaded_time is not None:
@@ -367,37 +460,17 @@ class AutoSeller(ConfigLoader):
         Display.info("Getting current limiteds cap")
         items_cap = await get_current_cap(self.auth)
 
-        ignored_items = list(self.seen | self.blacklist | self.not_resable)
-
         async for item, item_details, thumbnail in self.__fetch_items():
-            item_id = item["assetId"]
-
-            if (
-                item_id in ignored_items
-                or item_details["creatorTargetId"] in self.creators_blacklist
-            ):
-                continue
-
-            # Check if item is resellable
-            try:
-                async with self.auth.post(
-                    "apis.roblox.com/marketplace-items/v1/items/details",
-                    json={"itemIds": [item_id]}
-                ) as response:
-                    resale_data = await response.json()
-                    if resale_data and resale_data[0].get("resaleRestriction") == 1:
-                        self.not_resable.add(item_id)
-                        continue
-            except:
-                pass  # Skip if we can't check, will be filtered later
-
+            item_id = int(item["assetId"])
+            
+            # Item already processed in __fetch_items
             item_obj = self.get_item(item_id)
-
+            
             if item_obj is None:
                 asset_cap = items_cap[ITEM_TYPES[item_details["assetType"]]]["priceFloor"]
                 sell_price = define_sale_price(self.under_cut_amount, self.under_cut_type,
                                                asset_cap, item_details["lowestResalePrice"])
-
+                
                 item_obj = Item(
                     item, item_details,
                     price_to_sell=sell_price,
@@ -405,7 +478,7 @@ class AutoSeller(ConfigLoader):
                     auth=self.auth
                 )
                 self.add_item(item_obj)
-
+            
             item_obj.add_collectible(
                 serial=item["serialNumber"],
                 item_id=item["collectibleItemId"],
@@ -501,10 +574,13 @@ class AutoSeller(ConfigLoader):
         return self
 
     async def __aexit__(self, *_):
-        tasks = (
-            self.auth.close_session(),
-            self.control_panel.message.delete() if self.control_panel else None
-        )
+        tasks = []
+        tasks.append(self.auth.close_session())
+        if self.control_panel:
+            tasks.append(self.control_panel.message.delete())
+        
+        if self.rich_presence:
+            tasks.append(self.rich_presence.close())
 
         await asyncio.gather(*filter(None, tasks))
 
