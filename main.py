@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import os
+import aiohttp
 
 __import__("warnings").filterwarnings("ignore")
 
@@ -225,37 +226,69 @@ class AutoSeller(ConfigLoader):
             Tools.exit_program()
 
     async def sell_item(self):
-        try:
-            await Display.custom(
-                f"Selling [g{len(self.current.collectibles)}x] of [g{self.current.name}] items...",
-                "selling", Color(255, 153, 0))
+        max_retries = 5  # Increased from 3 to 5
+        retry_delay = 2  # Seconds to wait between retries
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                await Display.custom(
+                    f"Selling [g{len(self.current.collectibles)}x] of [g{self.current.name}] items...",
+                    "selling", Color(255, 153, 0))
 
-            sold_amount = await self.current.sell_collectibles(
-                skip_on_sale=self.skip_on_sale,
-                skip_if_cheapest=self.skip_if_cheapest,
-                verbose=True,
-                retries=3
-            )
+                sold_amount = await self.current.sell_collectibles(
+                    skip_on_sale=self.skip_on_sale,
+                    skip_if_cheapest=self.skip_if_cheapest,
+                    verbose=True,
+                    retries=3
+                )
 
-            if sold_amount is not None:
-                self.total_sold += sold_amount
+                if sold_amount is not None:
+                    self.total_sold += sold_amount
 
-                if self.sale_webhook and sold_amount > 0:
-                    asyncio.create_task(self.send_sale_webhook(self.current, sold_amount))
+                    if self.sale_webhook and sold_amount > 0:
+                        asyncio.create_task(self.send_sale_webhook(self.current, sold_amount))
 
-            if self.save_progress:
-                self.seen.add(self.current.id)
+                if self.save_progress:
+                    self.seen.add(self.current.id)
 
-            self.next_item()
-        except Exception as e:
-            Display.error(f"Error selling item: {str(e)}")
-            await asyncio.sleep(2)
-            self.next_item()
+                self.next_item()
+                return  # Success, exit the function
+                
+            except Exception as e:
+                error_msg = str(e)
+                
+                # Check if it's a 412 Precondition Failed error
+                if "412" in error_msg or "Precondition Failed" in error_msg:
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        Display.warning(f"Precondition Failed (412). Retrying in {retry_delay} seconds... (Attempt {retry_count}/{max_retries})")
+                        await asyncio.sleep(retry_delay)
+                        # Refresh item data before retrying
+                        try:
+                            await self.current.fetch_sales(save_sales=False)
+                            await self.current.fetch_resales(save_resales=False)
+                        except:
+                            pass
+                    else:
+                        Display.error(f"Failed to sell after {max_retries} attempts due to 412 errors. Skipping item.")
+                        if self.save_progress:
+                            self.seen.add(self.current.id)
+                        self.next_item()
+                        break
+                else:
+                    # For other errors, just log and move on
+                    Display.error(f"Error selling item: {error_msg}")
+                    await asyncio.sleep(2)
+                    if self.save_progress:
+                        self.seen.add(self.current.id)
+                    self.next_item()
+                    break
 
     async def _auto_sell_items(self):
         while not self.done:
             await self.sell_item()
-            await asyncio.sleep(1)  # Increased from 0.5 to 1 second
+            await asyncio.sleep(1.5)  # Increased delay to avoid rate limiting
 
     async def _manual_selling(self):
         while not self.done:
@@ -344,6 +377,19 @@ class AutoSeller(ConfigLoader):
                 or item_details["creatorTargetId"] in self.creators_blacklist
             ):
                 continue
+
+            # Check if item is resellable
+            try:
+                async with self.auth.post(
+                    "apis.roblox.com/marketplace-items/v1/items/details",
+                    json={"itemIds": [item_id]}
+                ) as response:
+                    resale_data = await response.json()
+                    if resale_data and resale_data[0].get("resaleRestriction") == 1:
+                        self.not_resable.add(item_id)
+                        continue
+            except:
+                pass  # Skip if we can't check, will be filtered later
 
             item_obj = self.get_item(item_id)
 
