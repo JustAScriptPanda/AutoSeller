@@ -1,24 +1,21 @@
 from enum import Enum
 import re
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
-SIGNATURE = f"UGC Limiteds Seller Tool v{VERSION}"
-TITLE = r"""  ___        _        _____      _ _           
- / _ \      | |      /  ___|    | | |          
-/ /_\ \_   _| |_ ___ \ `--.  ___| | | ___ _ __ 
-|  _  | | | | __/ _ \ `--. \/ _ \ | |/ _ \ '__|
-| | | | |_| | || (_) /\__/ /  __/ | |  __/ |   
-\_| |_/\__,_|\__\___/\____/ \___|_|_|\___|_|    
-
+SIGNATURE = f"Velo v{VERSION}"
+TITLE = r"""  __      ______      __      
+  \ \    / / __ \    / /      
+   \ \  / / |  | |  / /       
+    \ \/ /| |  | | / /        
+     \  / | |__| |/ /____     
+      \/   \____/|______|     
+                              
 """
 
 FAILED_IMAGE_URL = "https://i.ibb.co/Cs3Wvgb/7189017466763a9ed8874824aceba073.png"
-RAW_CODE_URL = "https://raw.githubusercontent.com/cofiprofim/AutoSeller/refs/heads/main/main.py"
-URL_REPOSITORY = "https://github.com/cofiprofim/AutoSeller"
-
-WEBHOOK_PATTERN = re.compile(r"https?://discord.com/api/webhooks/\d+/\w+[-_]\w+")
-COLOR_CODE_PATTERN = re.compile(r"\033\[[0-9;]*m")
+RAW_CODE_URL = "https://raw.githubusercontent.com/JustAScript/AutoSellerPanda/refs/heads/main/main.py"
+URL_REPOSITORY = "https://github.com/JustAScriptPanda/AutoSeller"
 
 ITEM_TYPES = {8: "Hat", 41: "HairAccessory", 42: "FaceAccessory", 43: "NeckAccessory",
               44: "ShoulderAccessory", 45: "FrontAccessory", 46: "BackAccessory",
