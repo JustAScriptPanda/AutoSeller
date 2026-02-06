@@ -91,7 +91,9 @@ class AutoSeller(ConfigLoader):
         return list(self._items.values())
 
     @property
-    def current(self) -> Item:
+    def current(self) -> Optional[Item]:
+        if not self.items or self.current_index >= len(self.items):
+            return None
         return self.items[self.current_index]
 
     def get_item(self, _id: int, default: Optional[Any] = None) -> Union[Item, Any]:
@@ -101,22 +103,26 @@ class AutoSeller(ConfigLoader):
         self._items.update({item.id: item})
         return item
 
-    def remove_item(self, _id: int) -> Item:
-        return self._items.pop(_id)
+    def remove_item(self, _id: int) -> Optional[Item]:
+        return self._items.pop(_id, None)
 
     def next_item(self, *, step_index: int = 1) -> None:
+        if not self.items:
+            self.done = True
+            return
+            
         self.current_index = (self.current_index + step_index) % len(self.items)
 
-        if self.presence_enabled and self.rich_presence:
+        if self.presence_enabled and self.rich_presence and self.current:
             asyncio.create_task(self.update_presence())
 
-        if not self.current_index:
+        if self.current_index == 0:
             self.done = True
 
         self.fetch_item_info(step_index=step_index)
 
     async def update_presence(self) -> None:
-        if not self.rich_presence:
+        if not self.rich_presence or not self.current:
             return
             
         easter_egg = random() < 0.3
@@ -137,11 +143,13 @@ class AutoSeller(ConfigLoader):
             Display.error(f"Failed to update rich presence: {str(e)}")
 
     async def filter_non_resable(self):
+        if not self.items:
+            return None
+            
         if (self.current_index + 2) % 30 or not self.current_index:
             return None
 
         try:
-            # Get the next 30 items starting from current_index
             start_idx = self.current_index
             end_idx = min(start_idx + 30, len(self.items))
             items_to_check = self.items[start_idx:end_idx]
@@ -155,16 +163,22 @@ class AutoSeller(ConfigLoader):
                 "https://apis.roblox.com/marketplace-items/v1/items/details",
                 json={"itemIds": item_ids}
             ) as response:
+                if response.status != 200:
+                    return None
+                    
                 response_data = await response.json()
                 
-                # Handle different response formats
+                if response_data is None:
+                    return
+                    
                 if isinstance(response_data, dict):
-                    # If it's a dict with data key
                     if "data" in response_data:
                         response_data = response_data["data"]
                     else:
-                        Display.error(f"Unexpected response format in filter_non_resable: {response_data}")
                         return
+                
+                if not isinstance(response_data, list):
+                    return
                 
                 for item_details in response_data:
                     if isinstance(item_details, dict):
@@ -172,25 +186,23 @@ class AutoSeller(ConfigLoader):
                         resale_restriction = item_details.get("resaleRestriction")
                         
                         if resale_restriction == 1 and item_id:
-                            # Convert to int for consistency
                             try:
                                 item_id_int = int(item_id)
                             except (ValueError, TypeError):
                                 continue
                                 
                             self.not_resable.add(item_id_int)
-                            # Remove the item from items list
                             if item_id_int in self._items:
                                 self.remove_item(item_id_int)
-                    else:
-                        Display.warning(f"Unexpected item format in response: {item_details}")
                         
         except Exception as e:
             Display.error(f"Error filtering non-resable items: {str(e)}")
 
     def fetch_item_info(self, *, step_index: int = 1) -> Optional[Iterable[Task]]:
+        if not self.items:
+            return None
+            
         try:
-            # Check if we have enough items
             if self.current_index + step_index >= len(self.items):
                 return None
                 
@@ -198,18 +210,26 @@ class AutoSeller(ConfigLoader):
         except IndexError:
             return None
 
-        return (
+        tasks = [
             asyncio.create_task(item.fetch_sales(save_sales=False)),
-            asyncio.create_task(item.fetch_resales(save_resales=False)),
-            asyncio.create_task(self.filter_non_resable())
-        )
+            asyncio.create_task(item.fetch_resales(save_resales=False))
+        ]
+        
+        if self.current_index % 30 == 0 and len(self.items) > 0:
+            tasks.append(asyncio.create_task(self.filter_non_resable()))
+            
+        return tasks
 
     def sort_items(self, _type: str) -> None:
-        self._items = dict(sorted(self._items.items(), key=lambda x: getattr(x[1], _type)))
+        if not self._items:
+            return
+        self._items = dict(sorted(self._items.items(), key=lambda x: getattr(x[1], _type, "")))
 
     async def start(self):
-        await asyncio.gather(self.auth.fetch_csrf_token(),
-                             self.handle_exceptions())
+        await asyncio.gather(
+            self.auth.fetch_csrf_token(),
+            self.handle_exceptions()
+        )
 
         Display.info("Checking cookie to be valid")
         if await self.auth.fetch_user_info() is None:
@@ -220,7 +240,8 @@ class AutoSeller(ConfigLoader):
             return Display.exception("You dont have premium to sell limiteds")
 
         await self._load_items()
-        self.sort_items("name")
+        if self.items:
+            self.sort_items("name")
 
         if self.presence_enabled and self.rich_presence:
             try:
@@ -246,12 +267,16 @@ class AutoSeller(ConfigLoader):
             return Display.exception(f"Error occurred:\n\n{str(e)}")
 
     async def start_selling(self):
-        for i in range(2):
+        for i in range(min(2, len(self.items))):
             for task in self.fetch_item_info(step_index=i) or []:
                 try:
                     await task
                 except Exception as e:
                     Display.error(f"Error fetching item info: {str(e)}")
+
+        if not self.items:
+            Display.error("No items to sell")
+            return
 
         if self.auto_sell: 
             await self._auto_sell_items()
@@ -271,8 +296,13 @@ class AutoSeller(ConfigLoader):
             Tools.exit_program()
 
     async def sell_item(self):
-        max_retries = 5  # Increased from 3 to 5
-        retry_delay = 2  # Seconds to wait between retries
+        if not self.current:
+            Display.error("No current item to sell")
+            self.next_item()
+            return
+            
+        max_retries = 5
+        retry_delay = 2
         retry_count = 0
         
         while retry_count < max_retries:
@@ -298,18 +328,16 @@ class AutoSeller(ConfigLoader):
                     self.seen.add(self.current.id)
 
                 self.next_item()
-                return  # Success, exit the function
+                return
                 
             except Exception as e:
                 error_msg = str(e)
                 
-                # Check if it's a 412 Precondition Failed error
                 if "412" in error_msg or "Precondition Failed" in error_msg:
                     retry_count += 1
                     if retry_count < max_retries:
                         Display.warning(f"Precondition Failed (412). Retrying in {retry_delay} seconds... (Attempt {retry_count}/{max_retries})")
                         await asyncio.sleep(retry_delay)
-                        # Refresh item data before retrying
                         try:
                             await self.current.fetch_sales(save_sales=False)
                             await self.current.fetch_resales(save_resales=False)
@@ -322,7 +350,6 @@ class AutoSeller(ConfigLoader):
                         self.next_item()
                         break
                 else:
-                    # For other errors, just log and move on
                     Display.error(f"Error selling item: {error_msg}")
                     await asyncio.sleep(2)
                     if self.save_progress:
@@ -331,12 +358,12 @@ class AutoSeller(ConfigLoader):
                     break
 
     async def _auto_sell_items(self):
-        while not self.done:
+        while not self.done and self.items:
             await self.sell_item()
-            await asyncio.sleep(1.5)  # Increased delay to avoid rate limiting
+            await asyncio.sleep(1.5)
 
     async def _manual_selling(self):
-        while not self.done:
+        while not self.done and self.items:
             try:
                 await self.update_console()
                 choice = (await aioconsole.ainput()).strip()
@@ -354,6 +381,10 @@ class AutoSeller(ConfigLoader):
                             if self.control_panel is not None:
                                 asyncio.create_task(self.control_panel.update_message(self.control_panel.make_embed()))
                     case "2":
+                        if not self.current:
+                            Display.error("No current item selected")
+                            continue
+                            
                         new_price = await Display.input(f"Enter the new price you want to sell: ")
 
                         if not new_price.isdigit():
@@ -369,11 +400,19 @@ class AutoSeller(ConfigLoader):
 
                         Display.success(f"Successfully set a new price to sell! ([g${self.current.price_to_sell}])")
                     case "3":
+                        if not self.current:
+                            Display.error("No current item to blacklist")
+                            continue
+                            
                         self.blacklist.add(self.current.id)
                         self.next_item()
 
                         Display.success(f"Successfully added [g{self.current.name} ({self.current.id})] into a blacklist!")
                     case "4":
+                        if not self.current:
+                            Display.error("No current item to skip")
+                            continue
+                            
                         if self.save_progress:
                             self.seen.add(self.current.id)
 
@@ -403,31 +442,30 @@ class AutoSeller(ConfigLoader):
         Display.info(f"Found {len(user_items)} items. Checking them...")
         items_details = await AssetsLoader(get_items_details, item_ids, 120).load(self.auth)
 
-        # Process in batches for resale check
         batch_size = 100
         for i in range(0, len(user_items), batch_size):
             batch_end = min(i + batch_size, len(user_items))
             batch_items = user_items[i:batch_end]
-            batch_details = items_details[i:batch_end]
-            batch_thumbnails = items_thumbnails[i:batch_end]
+            batch_details = items_details[i:batch_end] if items_details else []
+            batch_thumbnails = items_thumbnails[i:batch_end] if items_thumbnails else []
             
-            # Check resale for batch
             batch_item_ids = [str(item["assetId"]) for item in batch_items]
             try:
                 async with self.auth.post(
                     "https://apis.roblox.com/marketplace-items/v1/items/details",
                     json={"itemIds": batch_item_ids}
                 ) as response:
-                    resale_data = await response.json()
-                    if isinstance(resale_data, dict) and "data" in resale_data:
-                        resale_data = resale_data["data"]
-                    elif not isinstance(resale_data, list):
+                    if response.status == 200:
+                        resale_data = await response.json()
+                        if isinstance(resale_data, dict) and "data" in resale_data:
+                            resale_data = resale_data["data"]
+                        elif not isinstance(resale_data, list):
+                            resale_data = []
+                    else:
                         resale_data = []
-            except Exception as e:
-                Display.warning(f"Failed to check resale for batch: {str(e)}")
+            except Exception:
                 resale_data = []
             
-            # Create mapping of item_id to resale restriction
             resale_map = {}
             for rd in resale_data:
                 if isinstance(rd, dict):
@@ -436,19 +474,25 @@ class AutoSeller(ConfigLoader):
                     if item_id:
                         resale_map[str(item_id)] = restriction
             
-            # Process each item in batch
-            for item, item_details, thumbnail in zip(batch_items, batch_details, batch_thumbnails):
+            for idx, item in enumerate(batch_items):
                 item_id = str(item["assetId"])
                 
-                # Check resale restriction
+                item_details = batch_details[idx] if idx < len(batch_details) else {}
+                thumbnail = batch_thumbnails[idx] if idx < len(batch_thumbnails) else None
+                
                 if resale_map.get(item_id) == 1:
-                    self.not_resable.add(int(item_id))
+                    try:
+                        self.not_resable.add(int(item_id))
+                    except:
+                        pass
                     continue
                     
-                # Skip if in ignore lists
-                ignored_items = list(self.seen | self.blacklist | self.not_resable)
-                if (int(item_id) in ignored_items or 
-                    item_details.get("creatorTargetId") in self.creators_blacklist):
+                try:
+                    ignored_items = list(self.seen | self.blacklist | self.not_resable)
+                    if (int(item_id) in ignored_items or 
+                        item_details.get("creatorTargetId") in self.creators_blacklist):
+                        continue
+                except:
                     continue
                     
                 yield item, item_details, thumbnail
@@ -461,15 +505,39 @@ class AutoSeller(ConfigLoader):
         items_cap = await get_current_cap(self.auth)
 
         async for item, item_details, thumbnail in self.__fetch_items():
-            item_id = int(item["assetId"])
+            if not item_details:
+                continue
+                
+            try:
+                item_id = int(item["assetId"])
+            except:
+                continue
             
-            # Item already processed in __fetch_items
             item_obj = self.get_item(item_id)
             
             if item_obj is None:
-                asset_cap = items_cap[ITEM_TYPES[item_details["assetType"]]]["priceFloor"]
-                sell_price = define_sale_price(self.under_cut_amount, self.under_cut_type,
-                                               asset_cap, item_details["lowestResalePrice"])
+                if not items_cap:
+                    continue
+                    
+                asset_type = item_details.get("assetType")
+                if not asset_type:
+                    continue
+                    
+                item_type_key = ITEM_TYPES.get(asset_type)
+                if not item_type_key:
+                    continue
+                    
+                asset_cap_data = items_cap.get(item_type_key, {})
+                price_floor = asset_cap_data.get("priceFloor", 0)
+                
+                lowest_resale_price = item_details.get("lowestResalePrice", 0)
+                
+                sell_price = define_sale_price(
+                    self.under_cut_amount, 
+                    self.under_cut_type,
+                    price_floor, 
+                    lowest_resale_price
+                )
                 
                 item_obj = Item(
                     item, item_details,
@@ -479,11 +547,14 @@ class AutoSeller(ConfigLoader):
                 )
                 self.add_item(item_obj)
             
-            item_obj.add_collectible(
-                serial=item["serialNumber"],
-                item_id=item["collectibleItemId"],
-                instance_id=item["collectibleItemInstanceId"]
-            )
+            try:
+                item_obj.add_collectible(
+                    serial=item.get("serialNumber", 0),
+                    item_id=item.get("collectibleItemId"),
+                    instance_id=item.get("collectibleItemInstanceId")
+                )
+            except:
+                pass
 
         if not self.items:
             Display.error(f"You dont have any limiteds that are not in[g blacklist/] directory")
@@ -493,16 +564,22 @@ class AutoSeller(ConfigLoader):
                 self.seen.clear()
                 Display.success("Cleared your limiteds selling progress")
                 Tools.exit_program()
+            else:
+                return
 
         if self.keep_serials or self.keep_copy:
+            items_to_remove = []
             for item in self.items:
                 if len(item.collectibles) <= self.keep_copy:
-                    self.remove_item(item.id)
+                    items_to_remove.append(item.id)
                     continue
 
                 for col in item.collectibles:
                     if col.serial > self.keep_serials:
                         col.skip_on_sale = True
+            
+            for item_id in items_to_remove:
+                self.remove_item(item_id)
 
         if not self.items:
             not_met = []
@@ -514,10 +591,15 @@ class AutoSeller(ConfigLoader):
             return Display.exception(f"You dont have any limiteds with {list_requirements}")
 
         self.loaded_time = datetime.now()
+        Display.success(f"Successfully loaded {len(self.items)} items")
 
     async def update_console(self) -> None:
         Tools.clear_console()
         Display.main()
+
+        if not self.current:
+            Display.error("No items available")
+            return
 
         item = self.current
 
@@ -545,6 +627,9 @@ class AutoSeller(ConfigLoader):
                              "input", BaseColors.gray, end="")
     
     async def send_sale_webhook(self, item: Item, sold_amount: int) -> None:
+        if not item:
+            return
+            
         try:
             embed = discord.Embed(
                 color=2469096,
@@ -573,16 +658,16 @@ class AutoSeller(ConfigLoader):
     async def __aenter__(self):
         return self
 
-    async def __aexit__(self, *_):
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
         tasks = []
         tasks.append(self.auth.close_session())
-        if self.control_panel:
+        if self.control_panel and self.control_panel.message:
             tasks.append(self.control_panel.message.delete())
         
         if self.rich_presence:
             tasks.append(self.rich_presence.close())
 
-        await asyncio.gather(*filter(None, tasks))
+        await asyncio.gather(*filter(None, tasks), return_exceptions=True)
 
 
 async def main() -> None:
@@ -596,11 +681,18 @@ async def main() -> None:
 
     Display.info("Loading config")
     config = load_file("config.json")
+    if not config:
+        Display.exception("Failed to load config.json")
+        return
 
     Display.info("Loading data assets")
-    blacklist = FileSync("blacklist/blacklist.json")
-    seen = FileSync("blacklist/seen.json")
-    not_resable = FileSync("blacklist/not_resable.json")
+    try:
+        blacklist = FileSync("blacklist/blacklist.json")
+        seen = FileSync("blacklist/seen.json")
+        not_resable = FileSync("blacklist/not_resable.json")
+    except Exception as e:
+        Display.exception(f"Failed to load data files: {str(e)}")
+        return
 
     auto_seller = AutoSeller(config, blacklist, seen, not_resable)
 
@@ -612,70 +704,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-"""
-    ___     __      ___       _  _       _  _          _    _         _         ___          _  _       ____       ___        ____   
-   F _ ",   FJ     F __".    FJ  L]     F L L]        F L  J J       /.\       F __".       FJ  L]     F ___J     F _ ",     F ___J  
-  J `-' |  J  L   J (___|   J |  | L   J   \| L      J J .. L L     //_\\     J (___|      J |__| L   J |___:    J `-'(|    J |___:  
-  |  __/F  |  |   J\___ \   | |  | |   | |\   |      | |/  \| |    / ___ \    J\___ \      |  __  |   | _____|   |  _  L    | _____| 
-  F |__/   F  J  .--___) \  F L__J J   F L\\  J      F   /\   J   / L___J \  .--___) \     F L__J J   F L____:   F |_\  L   F L____: 
- J__|     J____L J\______J J\______/F J__L \\__L    J___//\\___L J__L   J__L J\______J    J__L  J__L J________L J__| \\__L J________L
- |__L     |____|  J______F  J______F  |__L  J__|    |___/  \___| |__L   J__|  J______F    |__L  J__| |________| |__|  J__| |________|
-                                                                                                                                     
-
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%#**##***%%%%%%%%%%%%%%%%%%%%%%%%%@@@@@@@@@@@@@@@@@@@@@@@@@@@
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%##*+=-:::::::::-----=+*##%%%%%%%%%%%%%%%%@@@@@@@@@@@@@@@@@@@@@@@
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%##+=--:::::::::::::::::::::::::-+*##%%%%%%%%%%%%%@@@@@@@@@@@@@@@@@@@@
-%%%%%%%%%%%%%%%%%%%%%%%%%%#**+=-:::::::::::::::::::::::::::::::::::-=**#%%%%%%%%%%%%%%@@@@@@@@@@@@@%
-######%%%%%%%%%%%%%%%%%##+=-:::::::::::::::::::::::::::::::::::::::::::=*#%%%%%%%%%%%%%%%%%%%%%%%%%%
-##########%%%%%%%%###*+=-::::::::::::::::::::::::::::::::::::::::::::::::-*#%%%%%%%%%%%%%%%%%%%%%%%%
-##############%%###+=----::::::::::::::::::::::::::::::::::::::::::::::::::-*#%%%%%%%%%%%%%%%%%%%%%%
-#################*=------------:----:::::::::::::::::::::::::::::::::::::::::-*#%%%%%%%%%%%%%%%%%%%%
-################*+=------------------------------:::::::::::::::::::::::::::::-*#%%%%%%%%%%%%%%%%%%%
-##############+=====------------------------------:::::::::::::::::::::::::::::=##%%%%%%%%%%%%%%%%%%
-############*=----===--------------=======------------:::::::::::::::::::::::::-*###%%%%%%%%%%%%%%%%
-##########*+------====-------===================---------::----:::::---::::::::-+######%%%%%%%%%%%%%
-#########*=--------====-===========+++++++****++===------------------=---:::::::=*#########%%%%%%%%%
-########+--------============+++++++++*###%@@@%#*+=====--------=++======---:::::=*###########%%%%%%%
-#######+=--------=============+++++++++%%%@@@@@@@#**++===-----=*#==+++===---:::-+*##############%%%%
-######+=---------=====------===========+*#%@@@@@@@@%%#**+++++*%@%#*##*++====---=+**##############%%%
-#####*==---------====------------=========+*#%%%%%%%%%#*******#%@@%%#**++++====--=+*################
-####*+==--------=====--------------=============+=++++*****#######%%#####***++===-=+***#############
-###*+===--------=====----------------================++*#%###%%###*******###**++===--+***###########
-##*====--------=====-------------------================+##**#######%%%%#####***++==--=+****#########
-##*======------====----==-=======------=================+**######%%%%%%%%%%%%%%#*#*=::-=+***########
-##+=======---======--------------==------=======------====++****###%%%%%##%%%@@%#+=-:::-+****#######
-#*+===============----------------==--------------=----====++***###%%%%%%%%#+--:::::::::-+****######
-#*+=========+=====------=====-------------------==--------===+****#**++----::::::::::::::-+*****####
-*+====================------------------------==----------===+++++++==----::::::::::::::::-+*****###
-+=========++++=========--=-----=--------------===----------=+++=======---:::::::::::::::::-=******##
-+==+++===+*++==--===============-----------------==---------++==+====-----:::::::::::::::::-+******#
-++++++++++*+++=====================----======---==----------====+==-----::::::::::::::::::::=+*****#
-+++=====++++++=+==================================--==---------====----:::::::::::::::::::::-+******
-++++====++**+++++++======++====++===============----==----------===----:::::::::::::::::::::-=+*****
-+++++++++****+==++++=====+++==++++===============-====-----------------:::::::::::::::::::::-=+*****
-**++++++****++++++++=======+++=+++========++===========----------------::::::::::::::::::::::=+*****
-**+*********++=++++++=======++++++=======================---------------::::::::::::::::::::-=++****
-**++++*+*****++*++*++++==========+================----=====-------------::::::::::::::::::::-=+*****
-**++++++*##***+++++=+++++=================---=======----===--------------::::::::::--::::::::=+*****
-********###***++==+++=++++======+=========-=---===---------=--------------:::::::::--:::::::-=+*****
-***+*****###**+++++=+==++++========++=+++====--===--===----==-------------::::::::--::::::::-++*****
-*********#####*+++*+++++++++==========++++=========-------------------------::-::--::::::::-=+******
-*********######++*+++++=++=+=========================------------------------------:::::::--+++*****
-*********######*****++++++++++++======================-----------------------------:::::::-=++++****
-*******#########******+*+=+++++++++=++=++====================---------------------:::::::-=++++++***
-*****############*+******+++++++++++++==+====================-------------------------:::-=+++++++**
-******############***#***++===+==+==+==========================-----------------------:--=+++++++++*
-******#############**##****+==+++++++====+++++===-==============------------------------=+++++++++++
-*******##########%%#****##****++++++++=+=+++=+==============---===---------------------=++++++++++++
-********###%%%%###%%%##*********++++++++++++==+====================---==--------------=+++++++++++++
-**********#%%%%%%#%%%%%##***+****+++++++==+++===----======+++++========-------------=+++++++++++++++
-***********##%%%%%%#%%%%%%####*****++++*++=+++++=======+++++++=====----======-----==++++++++++++++++
-************##%%%%%%%#%%%%%%%%######******++**++******+++++++=====----====-----===++++++++++++++*+++
-**************#%%%%%%%%%%%%%%%%%%%%%%%#########*#**#**+++++=+===================+++++++++++++++*****
-*********####**##%%%%%%%%%%%%%%%%%%%%%%%%%%%###***++++++==++==++==============+++++++++*************
-###################%%%@@@%%%%%%%##########*******++++++=++++++++++=========+++**********************
-%%%%%%%%%%%#%%%#%%%%%%%%@@@@@@@@%%##%##*##*****##**++++++++***++++++++++++**************************
-%%%%%%%%%%%%%%%%%%%%%%%%%%@@@@@@@@@@%%%%%@%########***************++++****************************##
-%%%%%%%%%%%%%%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%%%%%%%%%%##########********************************###
-"""
