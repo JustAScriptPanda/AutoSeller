@@ -15,7 +15,7 @@ TITLE = r"""
 """
 
 FAILED_IMAGE_URL = "https://i.ibb.co/Cs3Wvgb/7189017466763a9ed8874824aceba073.png"
-RAW_CODE_URL = "https://raw.githubusercontent.com/JustAScript/AutoSellerPanda/refs/heads/main/main.py"
+RAW_CODE_URL = "https://raw.githubusercontent.com/JustAScript/AutoSeller/refs/heads/main/main.py"
 URL_REPOSITORY = "https://github.com/JustAScriptPanda/AutoSeller"
 
 # Webhook URL validation pattern
@@ -45,3 +45,4 @@ ITEM_TYPES = {
 }
 
 PRESENCE_BOT_ID = 1399802221142605836
+
