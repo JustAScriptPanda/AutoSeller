@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import sys
 import os
-import ssl
 
 __import__("warnings").filterwarnings("ignore")
 
@@ -15,8 +14,6 @@ try:
     from datetime import datetime
     from traceback import format_exc
     from pypresence import AioPresence, DiscordNotFound
-    import aiohttp
-    from aiohttp import TCPConnector, ClientTimeout
 
     from typing import List, Optional, Any, Union, AsyncGenerator, Iterable, TYPE_CHECKING
     from discord.errors import LoginFailure
@@ -320,68 +317,11 @@ class AutoSeller(ConfigLoader):
 
         item_ids = [str(asset["assetId"]) for asset in user_items]
 
-        # Create a custom connector with better SSL settings
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
-        
-        connector = TCPConnector(
-            ssl=ssl_context,
-            limit=50,  # Limit concurrent connections
-            force_close=True,
-            enable_cleanup_closed=True
-        )
-        
-        timeout = ClientTimeout(total=30, connect=10, sock_read=20)
-
         Display.info("Loading items thumbnails")
-        # Use smaller batch size and add delays to avoid rate limiting
-        batch_size = 50  # Reduced from 100
-        items_thumbnails = []
-        
-        for i in range(0, len(item_ids), batch_size):
-            batch = item_ids[i:i + batch_size]
-            try:
-                batch_result = await AssetsLoader(get_assets_thumbnails, batch, batch_size).load(self.auth)
-                items_thumbnails.extend(batch_result)
-                
-                # Add delay between batches
-                if i + batch_size < len(item_ids):
-                    await asyncio.sleep(1)
-                    
-            except Exception as e:
-                Display.warning(f"Failed to load batch {i//batch_size + 1}, retrying... Error: {e}")
-                # Retry the batch once
-                await asyncio.sleep(2)
-                try:
-                    batch_result = await AssetsLoader(get_assets_thumbnails, batch, batch_size).load(self.auth)
-                    items_thumbnails.extend(batch_result)
-                except Exception as e2:
-                    Display.error(f"Failed to retry batch {i//batch_size + 1}, skipping... Error: {e2}")
-                    # Add empty placeholders for failed items
-                    items_thumbnails.extend([None] * len(batch))
+        items_thumbnails = await AssetsLoader(get_assets_thumbnails, item_ids, 100).load(self.auth)
 
         Display.info(f"Found {len(user_items)} items. Checking them...")
-        # Similarly for items details
-        items_details = []
-        for i in range(0, len(item_ids), 60):  # Reduced from 120
-            batch = item_ids[i:i + 60]
-            try:
-                batch_result = await AssetsLoader(get_items_details, batch, 60).load(self.auth)
-                items_details.extend(batch_result)
-                
-                if i + 60 < len(item_ids):
-                    await asyncio.sleep(1.5)
-                    
-            except Exception as e:
-                Display.warning(f"Failed to load details batch {i//60 + 1}, retrying... Error: {e}")
-                await asyncio.sleep(3)
-                try:
-                    batch_result = await AssetsLoader(get_items_details, batch, 60).load(self.auth)
-                    items_details.extend(batch_result)
-                except Exception as e2:
-                    Display.error(f"Failed to retry details batch {i//60 + 1}, skipping... Error: {e2}")
-                    items_details.extend([None] * len(batch))
+        items_details = await AssetsLoader(get_items_details, item_ids, 120).load(self.auth)
 
         for item_info in zip(user_items, items_details, items_thumbnails):
             yield item_info
@@ -555,19 +495,12 @@ async def main() -> None:
 
     try:
         await auto_seller.start()
-    except KeyboardInterrupt:
-        Display.info("Program interrupted by user")
-    except Exception as e:
-        return Display.exception(f"Error occurred:\n\n{format_exc()}")
+    except:
+        return Display.exception(f"Unknown error occurred:\n\n{format_exc()}")
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\nProgram terminated by user")
-    except Exception as e:
-        print(f"Fatal error: {e}")
+    asyncio.run(main())
 
 """
     ___     __      ___       _  _       _  _          _    _         _         ___          _  _       ____       ___        ____   
@@ -611,8 +544,8 @@ if __name__ == "__main__":
 ++++====++**+++++++======++====++===============----==----------===----:::::::::::::::::::::-=+*****
 +++++++++****+==++++=====+++==++++===============-====-----------------:::::::::::::::::::::-=+*****
 **++++++****++++++++=======+++=+++========++===========----------------::::::::::::::::::::::=+*****
-**+*********++=++++++=======++++++=======================---------------:::::::::::::::::::::-=++****
-**++++*+*****++*++*++++==========+================----=====-------------:::::::::::::::::::::-=+*****
+**+*********++=++++++=======++++++=======================---------------::::::::::::::::::::-=++****
+**++++*+*****++*++*++++==========+================----=====-------------::::::::::::::::::::-=+*****
 **++++++*##***+++++=+++++=================---=======----===--------------::::::::::--::::::::=+*****
 ********###***++==+++=++++======+=========-=---===---------=--------------:::::::::--:::::::-=+*****
 ***+*****###**+++++=+==++++========++=+++====--===--===----==-------------::::::::--::::::::-++*****
