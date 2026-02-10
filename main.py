@@ -2,6 +2,13 @@ from __future__ import annotations
 
 import sys
 import os
+import hmac
+import base64
+import hashlib
+import time
+import json
+import logging
+from math import floor
 
 __import__("warnings").filterwarnings("ignore")
 
@@ -9,15 +16,16 @@ try:
     import discord
     import aioconsole
     import asyncio
+    import aiohttp
     from random import random
     from rgbprint import Color
     from datetime import datetime
     from traceback import format_exc
     from pypresence import AioPresence, DiscordNotFound
-
     from typing import List, Optional, Any, Union, AsyncGenerator, Iterable, TYPE_CHECKING
     from discord.errors import LoginFailure
     from asyncio import Task
+    
     if TYPE_CHECKING:
         from .discord_bot.visuals.view import ControlPanel
 
@@ -38,9 +46,7 @@ except ModuleNotFoundError:
 
     if install:
         print("Installing modules now...")
-        print("hi")
-        os.system("pip uninstall pycord")
-        os.system("pip install aiohttp rgbprint discord.py aioconsole pypresence")
+        os.system("pip install aiohttp rgbprint discord.py aioconsole pypresence rich")
         print("Successfully installed required modules.")
     else:
         print("Aborting installing modules.")
@@ -48,13 +54,241 @@ except ModuleNotFoundError:
     input("Press \"enter\" to exit...")
     sys.exit(1)
 
-__all__ = ("AutoSeller",)
+__all__ = ("AutoSeller", "TwoStepVerification")
 
+# ==================== NEW: Two-Step Verification Class ====================
+class TwoStepVerification:
+    @staticmethod
+    def generate_totp(secret: str) -> str:
+        try:
+            missing_padding = len(secret) % 8
+            if missing_padding:
+                secret += '=' * (8 - missing_padding)
 
+            key = base64.b32decode(secret, casefold=True)
+            counter = int(time.time() // 30)
+            counter_bytes = counter.to_bytes(8, byteorder="big")
+            hmac_hash = hmac.new(key, counter_bytes, hashlib.sha1).digest()
+            
+            offset = hmac_hash[-1] & 0x0F
+            code = (
+                (hmac_hash[offset] & 0x7F) << 24 |
+                (hmac_hash[offset + 1] & 0xFF) << 16 |
+                (hmac_hash[offset + 2] & 0xFF) << 8 |
+                (hmac_hash[offset + 3] & 0xFF)
+            )
+            return str(code % 1000000).zfill(6)
+        except Exception as e:
+            print(f"TOTP Error: {e}")
+            return None
+
+    @staticmethod
+    async def handle_challenge(session, headers, user_id, challenge_id, challenge_metadata, challenge_type, totp_secret):
+        try:
+            if challenge_type not in ["twostepverification", "forceauthenticator"]:
+                print(f"Unsupported challenge type: {challenge_type}")
+                return None
+
+            metadata = json.loads(base64.b64decode(challenge_metadata).decode("utf-8"))
+            totp_code = TwoStepVerification.generate_totp(totp_secret)
+            if not totp_code:
+                return None
+
+            print(f"Handling {challenge_type} challenge with TOTP: {totp_code}")
+
+            if challenge_type == "forceauthenticator":
+                async with session.post(
+                    "https://apis.roblox.com/reauthentication-service/v1/token/redeem",
+                    json={"challengeId": challenge_id, "challengeMetadata": base64.b64decode(challenge_metadata).decode("utf-8"), "challengeType": challenge_type},
+                    headers=headers
+                ) as response:
+                    if response.status != 200:
+                        async with session.post(
+                            f"https://twostepverification.roblox.com/v1/users/{user_id}/challenges/authenticator/send-code",
+                            json={"challengeId": challenge_id, "actionType": "Generic"},
+                            headers=headers
+                        ) as send_response:
+                            if send_response.status != 200:
+                                print(f"Failed to send 2FA code: {await send_response.text()}")
+                                return None
+                            send_data = await send_response.json()
+                            new_challenge_id = send_data.get("challengeId")
+                            if not new_challenge_id:
+                                return None
+                            verify_payload = {"challengeId": new_challenge_id, "actionType": "Generic", "code": totp_code}
+                    else:
+                        redeem_data = await response.json()
+                        verify_payload = {"challengeId": redeem_data.get("challengeId") or challenge_id, "actionType": "Generic", "code": totp_code}
+
+                async with session.post(
+                    f"https://twostepverification.roblox.com/v1/users/{user_id}/challenges/authenticator/verify",
+                    json=verify_payload, headers=headers
+                ) as response:
+                    if response.status != 200:
+                        print(f"2FA verify failed: {await response.text()}")
+                        return None
+                    verification_token = (await response.json()).get("verificationToken")
+                    if not verification_token:
+                        return None
+
+                challenge_metadata_obj = {"verificationToken": verification_token, "rememberDevice": False, "challengeId": verify_payload['challengeId'], "actionType": "Generic"}
+                
+                async with session.post(
+                    "https://apis.roblox.com/challenge/v1/continue",
+                    json={"challengeId": challenge_id, "challengeMetadata": json.dumps(challenge_metadata_obj), "challengeType": "twostepverification"},
+                    headers=headers
+                ) as response:
+                    if response.status != 200:
+                        print(f"Challenge continue failed: {await response.text()}")
+                        return None
+
+                print("2FA challenge solved successfully")
+                return {
+                    "rblx-challenge-id": challenge_id,
+                    "rblx-challenge-metadata": base64.b64encode(json.dumps(challenge_metadata_obj).replace(" ", "").encode()).decode(),
+                    "rblx-challenge-type": "twostepverification"
+                }
+            else:
+                second_challenge_id = metadata.get("challengeId")
+                if not second_challenge_id:
+                    return None
+
+                async with session.post(
+                    f"https://twostepverification.roblox.com/v1/users/{user_id}/challenges/authenticator/verify",
+                    json={"challengeId": second_challenge_id, "actionType": metadata.get("actionType", "Generic"), "code": totp_code},
+                    headers=headers
+                ) as response:
+                    if response.status != 200:
+                        print(f"2FA verify failed: {await response.text()}")
+                        return None
+                    verification_token = (await response.json()).get("verificationToken")
+                    if not verification_token:
+                        return None
+
+                challenge_metadata_continue = json.dumps({
+                    "verificationToken": verification_token, "rememberDevice": False,
+                    "challengeId": second_challenge_id, "actionType": metadata.get("actionType", "Generic")
+                })
+
+                async with session.post(
+                    "https://apis.roblox.com/challenge/v1/continue",
+                    json={"challengeId": challenge_id, "challengeMetadata": challenge_metadata_continue, "challengeType": challenge_type},
+                    headers=headers
+                ) as response:
+                    if response.status != 200:
+                        print(f"Challenge continue failed: {await response.text()}")
+                        return None
+                    
+                    print("2FA challenge solved successfully")
+                    return {
+                        "rblx-challenge-id": challenge_id,
+                        "rblx-challenge-metadata": base64.b64encode(challenge_metadata_continue.replace(" ", "").encode()).decode(),
+                        "rblx-challenge-type": challenge_type
+                    }
+        except Exception as e:
+            print(f"Error handling 2FA challenge: {e}")
+            return None
+
+# ==================== ENHANCED Auth Class (core/clients.py update) ====================
+# Note: You'll need to update your existing Auth class to include these methods
+# or create an enhanced version. Here's what to add to Auth class:
+
+class EnhancedAuth(Auth):
+    """Enhanced Auth with 2FA support and better request handling"""
+    
+    def __init__(self, cookie: str, totp_secret: str = None, max_threads: int = 5):
+        super().__init__(cookie)
+        self.totp_secret = totp_secret
+        self.semaphore = asyncio.Semaphore(max_threads)
+        self.price_floor_cache = {}
+        
+    async def request_with_retry(self, method: str, url: str, max_retries: int = 5, **kwargs):
+        """Enhanced request with retry, 2FA handling, and rate limiting"""
+        for attempt in range(max_retries):
+            try:
+                request_headers = kwargs.pop('headers', {}).copy()
+                if self.csrf_token:
+                    request_headers['x-csrf-token'] = self.csrf_token
+                
+                async with self.semaphore:
+                    async with self.session.request(method, url, headers=request_headers, **kwargs) as response:
+                        response_text = await response.text()
+                        
+                        if response.status == 200:
+                            try:
+                                return json.loads(response_text)
+                            except json.JSONDecodeError:
+                                return True
+
+                        # Handle 2FA challenges
+                        if response.status == 403 and "rblx-challenge-id" in response.headers:
+                            if self.totp_secret:
+                                challenge_headers = await TwoStepVerification.handle_challenge(
+                                    self.session, request_headers, self.user_id,
+                                    response.headers["rblx-challenge-id"],
+                                    response.headers["rblx-challenge-metadata"],
+                                    response.headers["rblx-challenge-type"],
+                                    self.totp_secret
+                                )
+                                if challenge_headers:
+                                    request_headers.update(challenge_headers)
+                                    kwargs['headers'] = request_headers
+                                    continue
+                            else:
+                                print("2FA challenge received but no TOTP secret configured")
+                                return None
+
+                        # Handle CSRF token refresh
+                        if response.status == 403 and "x-csrf-token" in response.headers:
+                            self.csrf_token = response.headers["x-csrf-token"]
+                            print(f"CSRF token refreshed (attempt {attempt+1})")
+                            kwargs['headers'] = request_headers
+                            await asyncio.sleep(0.5)
+                            continue
+
+                        # Handle rate limiting
+                        if response.status == 429:
+                            wait_time = min(3 * (attempt + 1), 20)
+                            print(f"Rate limited (429), waiting {wait_time}s (attempt {attempt+1}/{max_retries})")
+                            await asyncio.sleep(wait_time)
+                            kwargs['headers'] = request_headers
+                            continue
+
+                        print(f"API Error {response.status}: {response_text[:500]}")
+                        return None
+                        
+            except asyncio.TimeoutError:
+                print(f"Request timeout (attempt {attempt+1})")
+                await asyncio.sleep(2)
+            except Exception as e:
+                print(f"Request error: {e}")
+                await asyncio.sleep(1)
+        
+        print(f"Max retries ({max_retries}) exceeded")
+        return None
+    
+    async def get_price_floor(self, asset_type: int) -> int:
+        """Get price floor with caching"""
+        if asset_type in self.price_floor_cache:
+            return self.price_floor_cache[asset_type]
+        
+        url = f"https://itemconfiguration.roblox.com/v1/items/price-floor?collectibleItemType=1&creationType=1&assetType={asset_type}"
+        data = await self.request_with_retry("GET", url)
+        
+        if data and isinstance(data, dict):
+            price_floor = data.get("priceFloor", 0)
+        else:
+            price_floor = 0
+            
+        self.price_floor_cache[asset_type] = price_floor
+        return price_floor
+
+# ==================== UPDATED AutoSeller Class ====================
 class AutoSeller(ConfigLoader):
     __slots__ = ("config", "_items", "auth", "buy_checker", "blacklist",
                  "seen", "not_resable", "current_index", "done",
-                 "total_sold", "selling", "loaded_time", "control_panel")
+                 "total_sold", "selling", "loaded_time", "control_panel",
+                 "price_floor_cache", "resell_cache", "enhanced_auth")
 
     def __init__(self,
                  config: dict,
@@ -66,7 +300,20 @@ class AutoSeller(ConfigLoader):
         self.config = config
 
         self._items = dict()
-        self.auth = Auth(config.get("Cookie", "").strip())
+        
+        # Use enhanced auth if TOTP secret is provided
+        if config.get("TOTP_Secret"):
+            self.auth = EnhancedAuth(
+                config.get("Cookie", "").strip(),
+                totp_secret=config.get("TOTP_Secret"),
+                max_threads=config.get("Settings", {}).get("Threads", 5)
+            )
+            print("[INFO] Enhanced Auth with 2FA support enabled")
+        else:
+            self.auth = Auth(config.get("Cookie", "").strip())
+            print("[WARNING] No TOTP_Secret in config. 2FA challenges may fail.")
+            
+        self.enhanced_auth = isinstance(self.auth, EnhancedAuth)
         self.buy_checker = BuyChecker(self)
 
         self.blacklist = blacklist
@@ -82,6 +329,10 @@ class AutoSeller(ConfigLoader):
         self.selling = WithBool()
         self.loaded_time: datetime = None
         self.control_panel: ControlPanel = None
+        
+        # New caching systems
+        self.price_floor_cache = {}
+        self.resell_cache = {}
 
     @property
     def items(self) -> List[Item]:
@@ -127,6 +378,57 @@ class AutoSeller(ConfigLoader):
             start=int(self.loaded_time.timestamp())
         )
 
+    # ==================== NEW: Enhanced API Methods ====================
+    async def get_cached_price_floor(self, asset_type: int) -> int:
+        """Get price floor with caching"""
+        if asset_type in self.price_floor_cache:
+            return self.price_floor_cache[asset_type]
+        
+        if self.enhanced_auth:
+            price_floor = await self.auth.get_price_floor(asset_type)
+        else:
+            # Fallback to manual request
+            url = f"https://itemconfiguration.roblox.com/v1/items/price-floor?collectibleItemType=1&creationType=1&assetType={asset_type}"
+            data = await self.auth.request("GET", url)
+            price_floor = data.get("priceFloor", 0) if data and isinstance(data, dict) else 0
+        
+        self.price_floor_cache[asset_type] = price_floor
+        return price_floor
+    
+    async def prefetch_resell_data(self, item_ids: list):
+        """Prefetch resell data for multiple items efficiently"""
+        print(f"[INFO] Prefetching resell data for {len(item_ids)} items...")
+        
+        for c_id in item_ids:
+            if c_id in self.resell_cache:
+                continue
+                
+            instances = {}
+            cursor = ""
+            
+            while True:
+                url = f"https://apis.roblox.com/marketplace-sales/v1/item/{c_id}/resellable-instances"
+                url += f"?ownerType=User&ownerId={self.auth.user_id}&limit=500"
+                if cursor:
+                    url += f"&cursor={cursor}"
+                
+                data = await self.auth.request("GET", url)
+                if not data or 'itemInstances' not in data:
+                    break
+                
+                for inst in data['itemInstances']:
+                    instance_id = inst.get("collectibleInstanceId")
+                    if instance_id:
+                        instances[instance_id] = inst
+                
+                cursor = data.get("nextPageCursor")
+                if not cursor:
+                    break
+            
+            self.resell_cache[c_id] = instances
+        
+        print(f"[INFO] Resell data cached for {len(self.resell_cache)} items")
+    
     async def filter_non_resable(self):
         if (self.current_index + 2) % 30 or not self.current_index:
             return None
@@ -309,22 +611,107 @@ class AutoSeller(ConfigLoader):
 
             await asyncio.sleep(0.7)
 
-    async def __fetch_items(self) -> AsyncGenerator:
-        Display.info("Loading your inventory")
-        user_items = await AssetsLoader(get_user_inventory, ITEM_TYPES.keys()).load(self.auth)
-        if not user_items:
+    # ==================== ENHANCED: Inventory Loading with Efficient Scanning ====================
+    async def __fetch_items_enhanced(self) -> AsyncGenerator:
+        """Enhanced inventory loading with batch processing"""
+        Display.info("Loading your inventory (enhanced mode)")
+        
+        # Define all collectible asset types
+        asset_types = [8, 41, 42, 43, 44, 45, 46, 47, 64, 65, 66, 67, 68, 69, 72]
+        all_items = []
+        
+        # Load all items from inventory
+        for asset_type in asset_types:
+            cursor = ""
+            while True:
+                data = await self.auth.request(
+                    "GET",
+                    f"https://inventory.roblox.com/v2/users/{self.auth.user_id}/inventory/{asset_type}?"
+                    f"cursor={cursor}&limit=100&sortOrder=Desc"
+                )
+                
+                if not data or 'data' not in data:
+                    break
+                
+                for item in data['data']:
+                    # Apply filters early
+                    if item.get("assetId") in self.blacklist:
+                        continue
+                    
+                    if item.get("serialNumber") and int(item.get("serialNumber", 0)) <= getattr(self, 'keep_serials', 0):
+                        continue
+                    
+                    all_items.append({
+                        "item": item,
+                        "asset_type": asset_type
+                    })
+                
+                cursor = data.get("nextPageCursor")
+                if not cursor:
+                    break
+        
+        if not all_items:
             Display.exception("You dont have any limited UGC items")
+            return
+        
+        # Batch process item details and thumbnails
+        item_ids = [str(item["item"]["assetId"]) for item in all_items]
+        
+        Display.info(f"Found {len(all_items)} items. Processing in batches...")
+        
+        # Get item details in batches of 120
+        items_details_map = {}
+        for i in range(0, len(item_ids), 120):
+            batch_ids = item_ids[i:i+120]
+            details = await get_items_details(self.auth, batch_ids)
+            if details and isinstance(details, list):
+                for detail in details:
+                    if detail and "assetId" in detail:
+                        items_details_map[detail["assetId"]] = detail
+        
+        # Get thumbnails in batches of 100
+        thumbnails_map = {}
+        for i in range(0, len(item_ids), 100):
+            batch_ids = item_ids[i:i+100]
+            thumbnails = await get_assets_thumbnails(self.auth, batch_ids)
+            if thumbnails and isinstance(thumbnails, list):
+                for thumb in thumbnails:
+                    if thumb and "assetId" in thumb:
+                        thumbnails_map[thumb["assetId"]] = thumb
+        
+        # Yield processed items
+        for entry in all_items:
+            item_data = entry["item"]
+            asset_id = item_data["assetId"]
+            
+            yield (
+                item_data,
+                items_details_map.get(asset_id, {}),
+                thumbnails_map.get(asset_id, {})
+            )
 
-        item_ids = [str(asset["assetId"]) for asset in user_items]
+    async def __fetch_items(self) -> AsyncGenerator:
+        # Use enhanced version if enabled in config
+        if self.config.get("Settings", {}).get("Use_Enhanced_Scanner", True):
+            async for item_info in self.__fetch_items_enhanced():
+                yield item_info
+        else:
+            # Original method
+            Display.info("Loading your inventory")
+            user_items = await AssetsLoader(get_user_inventory, ITEM_TYPES.keys()).load(self.auth)
+            if not user_items:
+                Display.exception("You dont have any limited UGC items")
 
-        Display.info("Loading items thumbnails")
-        items_thumbnails = await AssetsLoader(get_assets_thumbnails, item_ids, 100).load(self.auth)
+            item_ids = [str(asset["assetId"]) for asset in user_items]
 
-        Display.info(f"Found {len(user_items)} items. Checking them...")
-        items_details = await AssetsLoader(get_items_details, item_ids, 120).load(self.auth)
+            Display.info("Loading items thumbnails")
+            items_thumbnails = await AssetsLoader(get_assets_thumbnails, item_ids, 100).load(self.auth)
 
-        for item_info in zip(user_items, items_details, items_thumbnails):
-            yield item_info
+            Display.info(f"Found {len(user_items)} items. Checking them...")
+            items_details = await AssetsLoader(get_items_details, item_ids, 120).load(self.auth)
+
+            for item_info in zip(user_items, items_details, items_thumbnails):
+                yield item_info
 
     async def _load_items(self) -> None:
         if self.loaded_time is not None:
@@ -340,7 +727,7 @@ class AutoSeller(ConfigLoader):
 
             if (
                 item_id in ignored_items
-                or item_details["creatorTargetId"] in self.creators_blacklist
+                or item_details.get("creatorTargetId") in getattr(self, 'creators_blacklist', [])
             ):
                 continue
 
@@ -352,7 +739,7 @@ class AutoSeller(ConfigLoader):
                 
                 # Try to get the price floor from the new API if available
                 if items_cap and isinstance(items_cap, dict):
-                    item_type = ITEM_TYPES[item_details["assetType"]]
+                    item_type = ITEM_TYPES[item_details.get("assetType", 0)]
                     
                     # Check if items_cap has the expected structure
                     if isinstance(items_cap, dict) and "limitedItemPriceFloors" in items_cap:
@@ -363,8 +750,16 @@ class AutoSeller(ConfigLoader):
                         # Old structure
                         asset_cap = items_cap[item_type].get("priceFloor", 0)
                 
-                sell_price = define_sale_price(self.under_cut_amount, self.under_cut_type,
-                                               asset_cap, item_details["lowestResalePrice"])
+                # Get actual price floor from API if enhanced auth is available
+                if self.enhanced_auth:
+                    asset_cap = max(asset_cap, await self.get_cached_price_floor(item_details.get("assetType", 0)))
+                
+                sell_price = define_sale_price(
+                    getattr(self, 'under_cut_amount', 0),
+                    getattr(self, 'under_cut_type', 'percent'),
+                    asset_cap,
+                    item_details.get("lowestResalePrice", 0)
+                )
 
                 item_obj = Item(
                     item, item_details,
@@ -375,9 +770,9 @@ class AutoSeller(ConfigLoader):
                 self.add_item(item_obj)
 
             item_obj.add_collectible(
-                serial=item["serialNumber"],
-                item_id=item["collectibleItemId"],
-                instance_id=item["collectibleItemInstanceId"]
+                serial=item.get("serialNumber"),
+                item_id=item.get("collectibleItemId"),
+                instance_id=item.get("collectibleItemInstanceId")
             )
 
         if not self.items:
@@ -389,24 +784,31 @@ class AutoSeller(ConfigLoader):
                 Display.success("Cleared your limiteds selling progress")
                 Tools.exit_program()
 
-        if self.keep_serials or self.keep_copy:
+        if getattr(self, 'keep_serials', 0) or getattr(self, 'keep_copy', 0):
             for item in self.items:
-                if len(item.collectibles) <= self.keep_copy:
+                if len(item.collectibles) <= getattr(self, 'keep_copy', 0):
                     self.remove_item(item.id)
                     continue
 
                 for col in item.collectibles:
-                    if col.serial > self.keep_serials:
+                    if col.serial > getattr(self, 'keep_serials', 0):
                         col.skip_on_sale = True
 
         if not self.items:
             not_met = []
 
-            if self.keep_copy: not_met.append(f"{self.keep_copy} copies or higher")
-            if self.keep_serials: not_met.append(f"{self.keep_serials} serial or higher")
+            if getattr(self, 'keep_copy', 0): 
+                not_met.append(f"{getattr(self, 'keep_copy', 0)} copies or higher")
+            if getattr(self, 'keep_serials', 0): 
+                not_met.append(f"{getattr(self, 'keep_serials', 0)} serial or higher")
 
             list_requirements = ", ".join(not_met)
             return Display.exception(f"You dont have any limiteds with {list_requirements}")
+
+        # Prefetch resell data for better performance
+        if self.config.get("Settings", {}).get("Prefetch_Resell_Data", True):
+            unique_ids = list(set(item.id for item in self.items))
+            await self.prefetch_resell_data(unique_ids)
 
         self.loaded_time = datetime.now()
 
@@ -421,7 +823,8 @@ class AutoSeller(ConfigLoader):
                 "Discord Bot": define_status(self.discord_bot),
                 "Save Items": define_status(self.save_progress),
                 "Under Cut": f"-{self.under_cut_amount}{'%' if self.under_cut_type == 'percent' else ''}",
-                "Total Blacklist": f"{len(self.blacklist)}"
+                "Total Blacklist": f"{len(self.blacklist)}",
+                "2FA Enabled": "Yes" if self.enhanced_auth and self.auth.totp_secret else "No"
             },
             "Current Item": {
                 "Name": item.name,
