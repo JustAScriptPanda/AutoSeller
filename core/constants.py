@@ -1,7 +1,7 @@
 from enum import Enum
 import re
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 
 SIGNATURE = f"Velocity X v{VERSION}"
 
@@ -45,5 +45,6 @@ ITEM_TYPES = {
 }
 
 PRESENCE_BOT_ID = 1399802221142605836
+
 
 
